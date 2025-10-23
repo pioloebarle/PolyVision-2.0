@@ -1,11 +1,11 @@
 # Retrain.py
-
+# lacking anchor_manifest.json
 import os
 import sys
 import json
 import sqlite3
-import subprocess # NEW: To run the external training script
-import threading  # NEW: Although QThread handles it, it's good practice
+import subprocess 
+import threading 
 import shutil
 import random
 import yaml
@@ -21,6 +21,18 @@ from ComparisonDialog import ComparisonDialog
 from pathlib import Path
 import cv2
 import time
+
+# Ensure project root is available on sys.path so we can import Models package
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from Models.Retraining.data_curation import (
+    DEFAULT_SELECTION_MIX,
+    DIFFICULTY_ORDER,
+    build_or_load_manifest,
+    select_anchor_subset,
+)
 
 BASE_OUTPUT_DIRECTORY = "../Models/"
 
@@ -41,10 +53,6 @@ def get_retraining_data():
         return []
 
 def import_coco_data(image_dir, json_path, progress_callback):
-    """
-    Processes a COCO dataset and imports it into the project's retraining database.
-    Returns the number of images successfully imported.
-    """
     target_img_dir = "retrainingImages"
     db_path = "retrain_images.db"
     os.makedirs(target_img_dir, exist_ok=True)
@@ -123,29 +131,23 @@ class ImportThread(QThread):
         imported_count = import_coco_data(self.image_dir, self.json_path, self.progress_update)
         self.import_finished.emit(imported_count)
 
-# NEW: The QThread class for handling the background process
 class RetrainingThread(QThread):
-    """
-    Handles the full Train-Evaluate-Compare pipeline in the background.
-    """
-    # Signals for UI communication
     log_update = pyqtSignal(str)
     progress_update = pyqtSignal(int, int)
-    # NEW SIGNAL: Passes a dictionary with all results back to the UI.
     retraining_finished = pyqtSignal(dict)
 
     def __init__(self, model_type, config_overrides={}):
         super().__init__()
         polyvision_root = Path(__file__).resolve().parents[1]
         self.model_type = model_type
-        self.config_overrides = config_overrides # For HPO-optimized params
+        self.config_overrides = config_overrides 
         self.process = None
         self._is_running = True
         self.project_root = str(polyvision_root)   
+        self.anchor_mix = DEFAULT_SELECTION_MIX.copy()
     
     #not used as of the moment. safely delete it to have clean code
     def _find_project_root_containing(self, marker_dir: str = "production_models") -> str:
-        """Walk up from this file until we find a folder that contains `marker_dir`."""
         here = Path(__file__).resolve()
         for parent in [here.parent] + list(here.parents):
             if (parent / marker_dir).exists():
@@ -294,10 +296,6 @@ class RetrainingThread(QThread):
             return None
 
     def prepare_coco_annotations(self):
-        """
-        Merges new data with a "bridge" dataset composed of both RANDOM and HARD
-        examples from the original training set to improve fine-tuning robustness.
-        """
         self.log_update.emit("--- Starting Data Preparation (Bridge Strategy) ---")
         
         # --- 1. Load New Data from DB ---
@@ -307,21 +305,32 @@ class RetrainingThread(QThread):
         self.log_update.emit(f"Found {num_new_samples} new data points.")
 
         # --- 2. Load the Original Base Training Dataset ---
+        
         if self.model_type == 'Binary':
-            # Final Binary Model Paths
-            base_annotation_path = "../Models/SEAMaP-Binary-Full-6/train/_annotations.coco.json"
-            base_image_root = "../Models/SEAMaP-Binary-Full-6/train/"
-            ranked_list_path = "../Models/SEAMaP-Binary-Full-6/hard_examples_ranked.json"
-            
-            # For testing onle
-            # base_annotation_path = "../Models/Retraining/original_datasets/binary_90_percent/train/_annotations.coco.json"
-            # base_image_root = "../Models/Retraining/original_datasets/binary_90_percent/train/"
-            # ranked_list_path = "../Models/Retraining/original_datasets/binary_90_percent/hard_examples_ranked.json"
+            dataset_root = Path("../Models/SEAMaP-Binary-Full-6")
         else: # Multiclass
-            # Final Multiclass Model Paths
-            base_annotation_path = "../Models/SEAMaP-Multi-class-100-1/train/_annotations.coco.json"
-            base_image_root = "../Models/SEAMaP-Multi-class-100-1/train/"
-            ranked_list_path = "../Models/SEAMaP-Multi-class-100-1/hard_examples_ranked.json"
+            dataset_root = Path("../Models/SEAMaP-Multi-class-100-1")
+            
+        base_annotation_path = dataset_root / "train" / "_annotations.coco.json"
+        base_image_root = dataset_root / "train"
+        manifest_path = dataset_root / "anchor_manifest.json"
+        ranked_list_path = dataset_root / "hard_examples_ranked.json"
+        
+        # if self.model_type == 'Binary':
+        #     # Final Binary Model Paths
+        #     base_annotation_path = "../Models/SEAMaP-Binary-Full-6/train/_annotations.coco.json"
+        #     base_image_root = "../Models/SEAMaP-Binary-Full-6/train/"
+        #     ranked_list_path = "../Models/SEAMaP-Binary-Full-6/hard_examples_ranked.json"
+            
+        #     # For testing onle
+        #     # base_annotation_path = "../Models/Retraining/original_datasets/binary_90_percent/train/_annotations.coco.json"
+        #     # base_image_root = "../Models/Retraining/original_datasets/binary_90_percent/train/"
+        #     # ranked_list_path = "../Models/Retraining/original_datasets/binary_90_percent/hard_examples_ranked.json"
+        # else: # Multiclass
+        #     # Final Multiclass Model Paths
+        #     base_annotation_path = "../Models/SEAMaP-Multi-class-100-1/train/_annotations.coco.json"
+        #     base_image_root = "../Models/SEAMaP-Multi-class-100-1/train/"
+        #     ranked_list_path = "../Models/SEAMaP-Multi-class-100-1/hard_examples_ranked.json"
             
             # For testing onle
             # base_annotation_path = "../Models/Retraining/original_datasets/multiclass_90_percent/train/_annotations.coco.json"
@@ -333,55 +342,103 @@ class RetrainingThread(QThread):
             raise FileNotFoundError(f"Base annotation file not found: {base_annotation_path}")
 
         self.log_update.emit(f"Loading base dataset from: {base_annotation_path}")
-        with open(base_annotation_path, 'r') as f:
-            base_coco = json.load(f)
+        with open(base_annotation_path, 'r', encoding='utf-8') as handle:
+            base_coco = json.load(handle)
+        
+        # --- 3. Ensure manifest is available and deterministically select anchors ---
+        ranked_ids = []
+        if ranked_list_path.exists():
+            try:
+                with open(ranked_list_path, 'r', encoding='utf-8') as handle:
+                    ranked_data = json.load(handle)
+                ranked_ids = ranked_data.get('ranked_image_ids', [])
+            except Exception as exc:
+                self.log_update.emit(f"Warning: Failed to read {ranked_list_path}: {exc}")
+        else:
+            self.log_update.emit("Hard example ranking file not found; falling back to default ordering.")
+
+        manifest = build_or_load_manifest(
+            str(manifest_path),
+            base_coco,
+            ranked_ids,
+            dataset_name=dataset_root.name,
+        )
+
+        # self.log_update.emit(f"Anchor Data Ratio Slider set to: {self.base_data_percentage}%")
+        anchor_requested = num_new_samples
+        base_image_count = len(base_coco.get('images', []))
+        anchor_requested = min(anchor_requested, base_image_count)
+
+        selected_anchor_ids, bucket_counts, actual_anchor_total = select_anchor_subset(
+            manifest,
+            anchor_requested,
+            mix=self.anchor_mix,
+        )
+        bucket_summary = ", ".join(
+            f"{level}={bucket_counts.get(level, 0)}" for level in DIFFICULTY_ORDER
+        )
+        self.log_update.emit(
+            f"Requested {anchor_requested} anchor images; using {actual_anchor_total} ({bucket_summary})."
+        )
+
+        sampled_image_ids = set(selected_anchor_ids)
+        final_coco = {
+            "images": [img for img in base_coco['images'] if img['id'] in sampled_image_ids],
+            "annotations": [ann for ann in base_coco['annotations'] if ann['image_id'] in sampled_image_ids],
+            "categories": base_coco['categories'],
+        }
+
+        base_image_root_abs = base_image_root.resolve()
+        for img in final_coco['images']:
+            img_path = (base_image_root_abs / img['file_name']).resolve()
+            img['file_name'] = str(img_path)
         
         # --- 3. Build the "Bridge" Anchor Dataset ---
         # Use fixed 100% ratio for anchor data
         
         # --- 3a. Calculate Quotas for Random and Hard Anchors ---
         # Use all new samples as basis for anchor calculation
-        num_random_to_keep = num_new_samples
-        num_random_to_keep = min(num_random_to_keep, len(base_coco['images']))
+        # num_random_to_keep = num_new_samples
+        # num_random_to_keep = min(num_random_to_keep, len(base_coco['images']))
         
-        # We add a fixed ratio of HARD anchors (e.g., 50% of the random anchor count)
-        HARD_ANCHOR_RATIO = 0.5 
-        num_hard_to_keep = int(num_random_to_keep * HARD_ANCHOR_RATIO)
+        # # We add a fixed ratio of HARD anchors (e.g., 50% of the random anchor count)
+        # HARD_ANCHOR_RATIO = 0.5 
+        # num_hard_to_keep = int(num_random_to_keep * HARD_ANCHOR_RATIO)
         
-        # --- 3b. Select Random Anchor Images ---
-        self.log_update.emit(f"Selecting {num_random_to_keep} RANDOM old images...")
-        all_base_image_ids = [img['id'] for img in base_coco['images']]
-        if num_random_to_keep > 0:
-            random_ids = set(random.sample(all_base_image_ids, num_random_to_keep))
-        else:
-            random_ids = set()
+        # # --- 3b. Select Random Anchor Images ---
+        # self.log_update.emit(f"Selecting {num_random_to_keep} RANDOM old images...")
+        # all_base_image_ids = [img['id'] for img in base_coco['images']]
+        # if num_random_to_keep > 0:
+        #     random_ids = set(random.sample(all_base_image_ids, num_random_to_keep))
+        # else:
+        #     random_ids = set()
 
-        # --- 3c. Select Hard Anchor Images ---
-        ranked_list_path = os.path.join(os.path.dirname(base_image_root), "../hard_examples_ranked.json")
-        hard_ids = set()
-        if num_hard_to_keep > 0 and os.path.exists(ranked_list_path):
-            self.log_update.emit(f"Selecting top {num_hard_to_keep} HARDEST old images...")
-            with open(ranked_list_path, 'r') as f:
-                ranked_data = json.load(f)
-            # Take the top N IDs from the ranked list
-            hard_ids = set(ranked_data['ranked_image_ids'][:num_hard_to_keep])
-        elif num_hard_to_keep > 0:
-            self.log_update.emit(f"Warning: hard_examples_ranked.json not found. Skipping hard anchor selection.")
+        # # --- 3c. Select Hard Anchor Images ---
+        # ranked_list_path = os.path.join(os.path.dirname(base_image_root), "../hard_examples_ranked.json")
+        # hard_ids = set()
+        # if num_hard_to_keep > 0 and os.path.exists(ranked_list_path):
+        #     self.log_update.emit(f"Selecting top {num_hard_to_keep} HARDEST old images...")
+        #     with open(ranked_list_path, 'r') as f:
+        #         ranked_data = json.load(f)
+        #     # Take the top N IDs from the ranked list
+        #     hard_ids = set(ranked_data['ranked_image_ids'][:num_hard_to_keep])
+        # elif num_hard_to_keep > 0:
+        #     self.log_update.emit(f"Warning: hard_examples_ranked.json not found. Skipping hard anchor selection.")
 
-        # --- 3d. Combine and De-duplicate ---
-        sampled_image_ids = random_ids | hard_ids # Set union automatically handles duplicates
-        self.log_update.emit(f"Total unique anchor images selected: {len(sampled_image_ids)}")
+        # # --- 3d. Combine and De-duplicate ---
+        # sampled_image_ids = random_ids | hard_ids # Set union automatically handles duplicates
+        # self.log_update.emit(f"Total unique anchor images selected: {len(sampled_image_ids)}")
 
-        # Create the starting point for our final dataset
-        final_coco = {
-            "images": [img for img in base_coco['images'] if img['id'] in sampled_image_ids],
-            "annotations": [ann for ann in base_coco['annotations'] if ann['image_id'] in sampled_image_ids],
-            "categories": base_coco['categories']
-        }
+        # # Create the starting point for our final dataset
+        # final_coco = {
+        #     "images": [img for img in base_coco['images'] if img['id'] in sampled_image_ids],
+        #     "annotations": [ann for ann in base_coco['annotations'] if ann['image_id'] in sampled_image_ids],
+        #     "categories": base_coco['categories']
+        # }
         
-        # Correct image paths for the anchor images
-        for img in final_coco['images']:
-            img['file_name'] = os.path.abspath(os.path.join(base_image_root, img['file_name']))
+        # # Correct image paths for the anchor images
+        # for img in final_coco['images']:
+        #     img['file_name'] = os.path.abspath(os.path.join(base_image_root, img['file_name']))
         
         # --- 4. Merge the New Data (This part is unchanged) ---
         if not new_data_from_db:
@@ -443,10 +500,6 @@ class RetrainingThread(QThread):
         return final_annotations_path
 
     def prepare_training_command(self, annotations_path, output_dir):
-        """
-        Prepares the command to execute the external training script,
-        including the HPO overrides.
-        """
         train_script = "../Models/Retraining/train.py"
         config_file = f"../Models/Retraining/{self.model_type.lower()}_config.yaml"
 
@@ -710,7 +763,7 @@ class RetrainUI(QDialog):
         self.cancel_button = QPushButton("Cancel")
         self.close_button = QPushButton("Close")
         self.cancel_button.setEnabled(False)
-        # self.import_button.setEnabled(False)         #set to True if you use it
+        self.import_button.setEnabled(True)  #set to True if you use it
         button_layout.addWidget(self.import_button, alignment=Qt.AlignLeft)
         button_layout.addWidget(self.reset_button, alignment=Qt.AlignLeft)
         button_layout.addStretch()
@@ -990,12 +1043,6 @@ class RetrainUI(QDialog):
 
 
     def deploy_model(self, challenger_model_path):
-        """
-        Deploys the challenger model according to specific rules:
-        - Always preserve base model (specific timestamp directories)
-        - Remove any other retrained models (previous champions)
-        - Keep challenger as new active champion
-        """
         if not challenger_model_path or not os.path.exists(challenger_model_path):
             QMessageBox.critical(self, "Deployment Error", f"Challenger model not found at: {challenger_model_path}")
             return
