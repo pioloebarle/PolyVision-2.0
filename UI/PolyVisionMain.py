@@ -97,6 +97,11 @@ class Ui_MainWindow(QMainWindow):
             # Create a copy of a region from the original image
             cropped_image = Image.copy(left, top, right - left, bottom - top)
             
+            # Live overlays
+            if getattr(self, "show_grid", False):
+                # Grid + hover during tension calibration only
+                self.applyGridOverlay(cropped_image)
+                
             # Assuming graphicsView is a QGraphicsView
             self.graphicsView.setPixmap(QPixmap.fromImage(cropped_image))
             if self.autoFocusing is not None:
@@ -371,11 +376,27 @@ class Ui_MainWindow(QMainWindow):
         try:
             if self.settings is not None:
                 self.settings.hide()
-            self.calibrating = True 
-            self.measuring = False
-            self.measureLength()
+
+            if self.calibrateBTN.text() == "Finish":
+                self.cancelCalibration()
+                self.moveHome()
+                return
+            
+            chooser = CalibrationChoiceDialog(self)
+            if chooser.exec_() == QtWidgets.QDialog.Accepted:
+                if chooser.selection == "distance":
+                    # keep your existing distance calibration behavior
+                    self.calibrating = True
+                    self.measuring = False
+                    self.measureLength()  # leads to calculatePixelDistanceRation() -> CalibrateUI
+                elif chooser.selection == "tension":
+                    self.calibrateTension()
+            else:
+                # user cancelled
+                if self.settings is not None:
+                    self.settings.show()
         except Exception as e:
-            print("Error occurred during calibration:", e)
+            print("Error occurred during calibration selection:", e)
 
     def calculatePixelDistanceRation(self):
         calibrateUI = CalibrateUI()
@@ -410,6 +431,57 @@ class Ui_MainWindow(QMainWindow):
             
     def mouseReleaseEvent(self, event):
         pass
+    
+    def gridHoverMove(self, event):
+        try:
+            # Use local position for reliability
+            pos = event.pos()
+            pixmap = self.graphicsView.pixmap()
+            if pixmap is None:
+                return
+            qimage = pixmap.toImage()
+            width = qimage.width()
+            height = qimage.height()
+
+            # Account for QLabel centering (pixmap may be centered inside label)
+            label_w = self.graphicsView.width()
+            label_h = self.graphicsView.height()
+            off_x = max(0, (label_w - width) // 2)
+            off_y = max(0, (label_h - height) // 2)
+
+            # Translate widget coords to image coords
+            img_x = pos.x() - off_x
+            img_y = pos.y() - off_y
+
+            # Clamp within image bounds
+            x = max(0, min(width - 1, img_x))
+            y = max(0, min(height - 1, img_y))
+            self._hover_pos = (x, y)
+        except:
+            self._hover_pos = None
+        
+    def updateHoverFromGlobal(self):
+        try:
+            # Poll global cursor pos and map into image coords to keep hover active during modal dialogs
+            gpos = QCursor.pos()
+            local = self.graphicsView.mapFromGlobal(gpos)
+            pixmap = self.graphicsView.pixmap()
+            if pixmap is None:
+                return
+            qimage = pixmap.toImage()
+            width = qimage.width()
+            height = qimage.height()
+            label_w = self.graphicsView.width()
+            label_h = self.graphicsView.height()
+            off_x = max(0, (label_w - width) // 2)
+            off_y = max(0, (label_h - height) // 2)
+            img_x = local.x() - off_x
+            img_y = local.y() - off_y
+            if img_x < 0 or img_y < 0 or img_x >= width or img_y >= height:
+                return
+            self._hover_pos = (img_x, img_y)
+        except:
+            pass
 
     def goToDetect(self):
         
@@ -638,6 +710,7 @@ class Ui_MainWindow(QMainWindow):
             self.gcode_command = b"$X\r\n"
             self.ser.write(self.gcode_command)
             self.moveHome()
+            self.scanning_active = False
             self.paused = False
             self.currentScan = 0
             self.totalScan = 0
@@ -767,9 +840,7 @@ class Ui_MainWindow(QMainWindow):
 
     def manualScanBTN(self):   
         if self.scanBTN.text() == "Continue":
-            print("true")
             if self.autoScanning is not None:
-                print("true")
                 self.autoScanning.event.set()
         else:
             self.manualScanMP()
@@ -903,6 +974,10 @@ class Ui_MainWindow(QMainWindow):
 
         overall_start_time = time.perf_counter()
         
+        if self.totalScan <= 0:
+            self.progressBar.setProperty("value", 0)
+            return
+        
         self.currentScan += 1
         self.progressBar.setProperty("value", (self.currentScan/self.totalScan) * 100)
         self.x = self.autoScanning.x
@@ -911,8 +986,6 @@ class Ui_MainWindow(QMainWindow):
         self.yValue.setText(f"{-self.y:.1f}")
 
         currentFrame = self.captureCurrentFrame()
-        # IMPORTANT: Store original frame for measuring during AutoScan
-        # self.original_autoscan_frame = currentFrame #remove this but test first
         image = Image.fromqimage(currentFrame)
         sized = image.resize((640, 640), Image.LANCZOS)
         
@@ -921,8 +994,7 @@ class Ui_MainWindow(QMainWindow):
             if hasattr(self.VideoCapture, 'set_detection_priority'):
                 self.VideoCapture.set_detection_priority(True)
             
-        self.paused = True #pause while requesting from API
-        # Removed manual gc.collect() 
+        self.paused = True #pause 
 
         # Uses the resized PIL Image
         start_detect = time.perf_counter()
@@ -1505,6 +1577,497 @@ class Ui_MainWindow(QMainWindow):
         self.statisticsButton.setShortcut("Ctrl+A")
         self.retrainButton.setShortcut("Ctrl+R")
 
+    def showLargeResultsDialog(self, title, text):
+        try:
+            dialog = QDialog(self)
+            dialog.setWindowTitle(title)
+            dialog.resize(900, 700)
+            layout = QVBoxLayout(dialog)
+            scroll = QScrollArea(dialog)
+            scroll.setWidgetResizable(True)
+            container = QWidget()
+            v = QVBoxLayout(container)
+            label = QLabel(text, container)
+            label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            label.setWordWrap(True)
+            v.addWidget(label)
+            scroll.setWidget(container)
+            layout.addWidget(scroll)
+            btn = QPushButton("Close", dialog)
+            btn.clicked.connect(dialog.accept)
+            layout.addWidget(btn)
+            dialog.exec_()
+        except Exception as e:
+            print("showLargeResultsDialog error:", e)
+
+    def TensionSummary(self, title, remarks=None, details=None):
+        """Beautified summary dialog specifically for tension calibration.
+
+        remarks: optional short status/next steps line.
+        details: optional multiline report body.
+        """
+        try:
+            # Backward compatibility: if only one text blob provided, treat it as the details.
+            if details is None:
+                details = remarks or ""
+                remarks = None
+
+            dialog = QDialog(self)
+            dialog.setWindowTitle(title)
+            dialog.setFixedSize(400, 300)  # Smaller, more reasonable size
+            
+            layout = QVBoxLayout(dialog)
+            layout.setContentsMargins(15, 15, 15, 15)
+            layout.setSpacing(12)
+            
+            # Title section
+            title_label = QLabel(title)
+            title_label.setAlignment(Qt.AlignCenter)
+            layout.addWidget(title_label)
+            
+            # Scrollable content area
+            scroll = QScrollArea(dialog)
+            scroll.setWidgetResizable(True)
+            scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+            scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+            
+            container = QWidget()
+            v = QVBoxLayout(container)
+            v.setContentsMargins(12, 12, 12, 12)
+
+            if remarks:
+                remarks_label = QLabel(remarks)
+                remarks_label.setWordWrap(True)
+                v.addWidget(remarks_label)
+            
+            # Content label with better formatting
+            content_label = QLabel(details)
+            content_label.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
+            content_label.setWordWrap(True)
+            content_label.setStyleSheet("""
+                QLabel {
+                    background-color: transparent;
+                    color: #495057;
+                    font-family: 'Consolas', 'Monaco', monospace;
+                    line-height: 1.4;
+                    padding: 8px;
+                    font-size: 14px
+                }
+            """)
+            v.addWidget(content_label)
+            v.addStretch()
+            
+            scroll.setWidget(container)
+            layout.addWidget(scroll)
+            
+            # Button section
+            button_layout = QHBoxLayout()
+            button_layout.addStretch()
+            
+            close_btn = QPushButton("Close")
+            close_btn.setFixedSize(100, 35)
+            close_btn.clicked.connect(dialog.accept)
+            button_layout.addWidget(close_btn)
+            
+            layout.addLayout(button_layout)
+            
+            # Center the dialog on the parent
+            if self.parent():
+                dialog.move(
+                    self.parent().geometry().center() - dialog.rect().center()
+                )
+            
+            dialog.exec_()
+        except Exception as e:
+            print("TensionSummary error:", e)
+
+    # Custom positioned dialogs for tension calibration
+    def TensionDialogPos(self, dialog_class, *args, **kwargs):
+        try:
+            dialog = dialog_class(self, *args, **kwargs)
+            
+            # Get graphics view position and size
+            graphics_rect = self.graphicsView.geometry()
+            graphics_global_pos = self.graphicsView.mapToGlobal(self.graphicsView.rect().topLeft())
+            
+            # Position in lower left of graphics view
+            dialog_x = graphics_global_pos.x() + 20  # 20px from left edge
+            dialog_y = graphics_global_pos.y() + graphics_rect.height() - dialog.height() - 20  # 20px from bottom
+            
+            dialog.move(dialog_x, dialog_y)
+            return dialog
+        except Exception as e:
+            print(f"Error positioning tension dialog: {e}")
+            return dialog_class(self, *args, **kwargs)
+
+    def verificationBox(self, message):
+        try:
+            dialog = QDialog(self)
+            dialog.setWindowTitle("Tension Calibration")
+            dialog.setFixedSize(250, 100)
+
+            layout = QVBoxLayout(dialog)
+            layout.setContentsMargins(20, 15, 20, 15)
+            layout.setSpacing(15)
+
+            message_label = QLabel(message)
+            message_label.setWordWrap(True)
+            layout.addWidget(message_label)
+
+            button_layout = QHBoxLayout()
+
+            yes_btn = QPushButton("Yes")
+            no_btn  = QPushButton("No")
+            no_btn.setObjectName("cancel")
+
+            button_layout.addWidget(yes_btn)
+            button_layout.addWidget(no_btn)
+            layout.addLayout(button_layout)
+
+            # Return distinct codes
+            yes_btn.clicked.connect(lambda: dialog.done(1))  # YES
+            no_btn.clicked.connect(lambda: dialog.done(2))   # NO
+            # Clicking the window "X" will return 0 automatically
+
+            # Position dialog (lower-left of graphicsView)
+            graphics_rect = self.graphicsView.geometry()
+            graphics_global_pos = self.graphicsView.mapToGlobal(self.graphicsView.rect().topLeft())
+            dialog_x = graphics_global_pos.x() + 20
+            dialog_y = graphics_global_pos.y() + graphics_rect.height() - dialog.height() - 20
+            dialog.move(dialog_x, dialog_y)
+
+            return dialog.exec_()  # 1=Yes, 2=No, 0=X/close
+        except Exception as e:
+            print(f"Error in tension verification dialog: {e}")
+            # Fallback: can't distinguish No vs X here, so treat as Accept/Reject
+            return VerificationBox(message).exec_()
+
+
+        except Exception as e:
+            print(f"Error in tension verification dialog: {e}")
+            # Fallback to standard verification
+            verify = VerificationBox(message)
+            return verify.exec_()
+    
+    def TensionOkayBox(self, message):
+        try:
+            dialog = QDialog(self)
+            dialog.setWindowTitle("Tension Calibration")
+            dialog.setFixedSize(300, 140)
+
+            layout = QVBoxLayout(dialog)
+            layout.setContentsMargins(20, 15, 20, 15)
+            layout.setSpacing(15)
+
+            # Message
+            message_label = QLabel(message)
+            message_label.setWordWrap(True)
+            layout.addWidget(message_label)
+
+            # Button
+            button_layout = QHBoxLayout()
+
+            ok_btn = QPushButton("OK")
+
+            # Add OK button to the layout
+            button_layout.addWidget(ok_btn)
+            layout.addLayout(button_layout)
+
+            # Connect button
+            ok_btn.clicked.connect(dialog.accept)
+
+            # Position dialog (lower-left corner of the graphics view)
+            graphics_rect = self.graphicsView.geometry()
+            graphics_global_pos = self.graphicsView.mapToGlobal(self.graphicsView.rect().topLeft())
+
+            dialog_x = graphics_global_pos.x() + 20  # 20px from the left
+            dialog_y = graphics_global_pos.y() + graphics_rect.height() - dialog.height() - 20  # 20px from the bottom
+            dialog.move(dialog_x, dialog_y)
+
+            # Show the dialog
+            return dialog.exec_()
+
+        except Exception as e:
+            print(f"Error in tension OK dialog: {e}")
+            return None
+
+    def cancelCalibration(self):
+        # Check if 'Finish' is set, meaning calibration is in progress
+        if self.calibrateBTN.text() == "Finish":
+            self.calibrateBTN.setText("Calibrate")
+            self.show_grid = False  # Hide the grid
+            self._hover_pos = None  # Reset hover position
+            self.graphicsView.setMouseTracking(False)  # Disable mouse tracking
+            
+            try:
+                if hasattr(self, '_hover_timer') and self._hover_timer is not None:
+                    self._hover_timer.stop()  # Stop the hover timer
+                    self._hover_timer = None
+            except:
+                pass
+
+            self.paused = False  # Unpause to resume live feed
+        else:
+            pass
+           
+    # Here are the changes
+    def calibrateTension(self):
+        try:
+            self.calibrateBTN.setText("Finish")
+            completed = False
+
+            if not self.ser:
+                prompt = OkayMessageBox("Connect to GRBL first")
+                prompt.exec_()
+                return
+
+            # Keep live feed; enable grid overlay & hover tracking
+            self.show_grid = True
+            self._hover_pos = None
+            self.graphicsView.setMouseTracking(True)
+            try:
+                self._hover_timer = QTimer(self)
+                self._hover_timer.timeout.connect(self.updateHoverFromGlobal)
+                self._hover_timer.start(33)
+            except:
+                pass
+
+            # Move to center and confirm user is ready to start asking alignment questions
+            self.moveToGridCenter()
+            if self.graphicsView.pixmap() is None:
+                OkayMessageBox("Camera is not ready. Start a file/camera first.").exec_()
+                return
+
+            go = self.TensionOkayBox("We will record alignment at each position.\nClick OK when you're ready to start.")
+            if go != QDialog.Accepted:
+                return
+
+            results = []  # (label, bool)
+
+            def ask_alignment(label):
+                res = self.verificationBox("Is the crosshair aligned to the grid?")
+                if res == 0:          # X clicked -> cancel the sequence
+                    return False
+                aligned = (res == 1)  # 1 = Yes, 2 = No
+                results.append((label, aligned))
+                time.sleep(0.05)
+                return True
+
+
+            travel_steps = 1  
+
+            self.moveToGridCenter()
+
+            self.moveLeftSteps(travel_steps)
+            if not ask_alignment("Left"): return
+            
+            self.moveRightSteps(travel_steps)
+            if not ask_alignment("Center After Left"): return
+
+            self.moveRightSteps(travel_steps)
+            if not ask_alignment("Right"): return
+            
+            self.moveLeftSteps(travel_steps)
+            if not ask_alignment("Center After Right"): return
+
+            self.moveUpSteps(travel_steps)
+            if not ask_alignment("Up"): return
+            
+            self.moveDownSteps(travel_steps)
+            if not ask_alignment("Center After Up"): return
+
+            self.moveDownSteps(travel_steps)
+            if not ask_alignment("Down"): return
+            
+            self.moveUpSteps(travel_steps)
+            if not ask_alignment("Center After Down"): return
+
+            self.moveToGridCenter()
+
+            no_count = sum(1 for _, ok in results if not ok)
+            status = "FAILED" if no_count >= 2 else "PASSED"
+
+            lines = []
+            for label, ok in results:
+                mark = "✓ YES" if ok else "✗ NO"
+                lines.append(f"{label:18} : {mark}")
+            lines.append("")
+            lines.append(f"NO count: {no_count}  →  {status}")
+
+            # Show summary
+            if status == "PASSED":
+                remarks = "Alignment looks acceptable at most checkpoints."
+            else:
+                remarks = "At least two checkpoints were misaligned. Adjust tension and try again."
+            self.TensionSummary(f"Tension Calibration {status}", remarks, "\n".join(lines))
+
+            completed = True
+
+        except Exception as e:
+            print("Calibrate Tension error:", e)
+        finally:
+            if completed:
+                # Turn off grid/hover and reset UI
+                self.show_grid = False
+                self._hover_pos = None
+                self.graphicsView.setMouseTracking(False)
+                self.calibrateBTN.setText("Calibrate")
+                self.moveHome()
+                try:
+                    if hasattr(self, '_hover_timer') and self._hover_timer is not None:
+                        self._hover_timer.stop()
+                        self._hover_timer = None
+                except:
+                    pass
+
+
+    def moveToGridCenter(self):
+        try:
+            if not self.ser:
+                return
+            feed = self.grbl_settings.get("max_feedrate", 1000)
+            dx = 15 - self.x
+            dy = 15 - self.y
+            if dx != 0:
+                if self.grbl_settings.get("area_scan", False):
+                    cmd = f"G21 G91 G1 X{'-' if dx>0 else ''}{abs(dx)} F{feed}\r\n"
+                else:
+                    cmd = f"G21 G91 G1 X{'' if dx>0 else '-'}{abs(dx)} F{feed}\r\n"
+                self.ser.write(cmd.encode('utf-8'))
+                time.sleep(0.1 + abs(dx) * 0.05)
+                self.x = 15
+                self.xValue.setText(str(self.x))
+            if dy != 0:
+                if self.grbl_settings.get("area_scan", False):
+                    cmd = f"G21 G91 G1 Y{'' if dy>0 else '-'}{abs(dy)} F{feed}\r\n"
+                else:
+                    cmd = f"G21 G91 G1 Y{'' if dy>0 else '-'}{abs(dy)} F{feed}\r\n"
+                self.ser.write(cmd.encode('utf-8'))
+                time.sleep(0.1 + abs(dy) * 0.05)
+                self.y = 15
+                self.yValue.setText(str(self.y))
+        except:
+            pass
+
+    def moveLeftSteps(self, n):
+        print(f"Moving left {n} steps...")
+        for i in range(n):
+            self.moveLeft()
+            time.sleep(0.1)  # Increased delay for better stability
+        print(f"Left movement completed. Current position: ({self.x}, {self.y})")
+
+    def moveRightSteps(self, n):
+        print(f"Moving right {n} steps...")
+        for i in range(n):
+            self.moveRight()
+            time.sleep(0.1)  # Increased delay for better stability
+        print(f"Right movement completed. Current position: ({self.x}, {self.y})")
+
+    def moveUpSteps(self, n):
+        print(f"Moving up {n} steps...")
+        for i in range(n):
+            self.moveUp()
+            time.sleep(0.1)  # Increased delay for better stability
+        print(f"Up movement completed. Current position: ({self.x}, {self.y})")
+
+    def moveDownSteps(self, n):
+        print(f"Moving down {n} steps...")
+        for i in range(n):
+            self.moveDown()
+            time.sleep(0.1)  # Increased delay for better stability
+        print(f"Down movement completed. Current position: ({self.x}, {self.y})")
+
+    def drawGridOverlay(self):
+        try:
+            pixmap = self.graphicsView.pixmap()
+            if pixmap is None:
+                return
+            qimage = pixmap.toImage()
+            painter = QPainter(qimage)
+            width = qimage.width()
+            height = qimage.height()
+
+            # --- ONLY the green center crosshair ---
+            pen_center = QPen(QColor(0, 255, 0), 3)
+            painter.setPen(pen_center)
+            cx = int(15 * (width / 30.0))
+            cy = int(15 * (height / 30.0))
+            painter.drawLine(cx, 0, cx, height)
+            painter.drawLine(0, cy, width, cy)
+
+            painter.end()
+            self.graphicsView.setPixmap(QPixmap.fromImage(qimage))
+        except:
+            pass
+
+
+    def applyGridOverlay(self, qimage):
+        try:
+            painter = QPainter(qimage)
+            width = qimage.width()
+            height = qimage.height()
+
+            # --- ONLY the green center crosshair (no yellow grid, no labels) ---
+            pen_center = QPen(QColor(0, 255, 0), 3)
+            painter.setPen(pen_center)
+            cx = int(15 * (width / 30.0))
+            cy = int(15 * (height / 30.0))
+            painter.drawLine(cx, 0, cx, height)
+            painter.drawLine(0, cy, width, cy)
+
+            # (Optional) keep the small hover tooltip; remove this block if you want absolutely nothing else
+            if self._hover_pos is not None:
+                hx, hy = self._hover_pos
+                gx = (hx / width) * 30.0
+                gy = (hy / height) * 30.0
+                txt = f"({gx:.1f}, {gy:.1f})"
+                bg = QColor(0, 0, 0, 160)
+                fg = QColor(255, 255, 255)
+                metrics = painter.fontMetrics()
+                tw = metrics.horizontalAdvance(txt)
+                th = metrics.height()
+                bx = min(max(0, hx + 10), width - tw - 6)
+                by = min(max(th, hy + 10), height)
+                painter.fillRect(bx, by - th, tw + 6, th, bg)
+                painter.setPen(fg)
+                painter.drawText(bx + 3, by - metrics.descent(), txt)
+
+            painter.end()
+        except:
+            pass
+
+    def applyHoverOverlay(self, qimage):
+        try:
+            if self._hover_pos is None:
+                return
+            painter = QPainter(qimage)
+            width = qimage.width()
+            height = qimage.height()
+            hx, hy = self._hover_pos
+            gx = (hx / width) * 30.0
+            gy = (hy / height) * 30.0
+            txt = f"({gx:.1f}, {gy:.1f})"
+            # small target cross at cursor
+            painter.setPen(QPen(QColor(0, 255, 0), 1))
+            painter.drawLine(hx - 6, hy, hx + 6, hy)
+            painter.drawLine(hx, hy - 6, hx, hy + 6)
+            # tooltip box
+            bg = QColor(0, 0, 0, 160)
+            fg = QColor(255, 255, 255)
+            font = painter.font()
+            font.setPointSize(10)
+            painter.setFont(font)
+            metrics = painter.fontMetrics()
+            tw = metrics.horizontalAdvance(txt)
+            th = metrics.height()
+            bx = min(max(0, hx + 10), width - tw - 6)
+            by = min(max(th, hy + 10), height)
+            painter.fillRect(bx, by - th, tw + 6, th, bg)
+            painter.setPen(fg)
+            painter.drawText(bx + 3, by - metrics.descent(), txt)
+            painter.end()
+        except:
+            pass
 
 
 class VideoCapture(QThread):
@@ -1587,7 +2150,7 @@ class AutoScan(QThread):
                     self.event.clear()
                 #================= START AUTOMATED SCAN ================#
                 string = "G21 G91 G1 X" 
-                string += str(-(abs(self.start_x)+1)) + " F1000\r\n"
+                string += str(-(abs(self.start_x)+3.0)) + " F1000\r\n"
                 toSend = string.encode('utf-8')
                 self.ser.write(toSend)
                 self.x -= self.start_x
@@ -1790,6 +2353,37 @@ class AutoFocus(QThread):
             # arr = arr[:, :, :3]
 
         return arr
+
+class CalibrationChoiceDialog(QtWidgets.QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.selection = None
+        self.setWindowTitle("Calibration")
+        self.setFixedSize(340, 100)
+        self.setWindowIcon(QIcon("res/PolyVisionLogo.png"))
+
+        layout = QtWidgets.QVBoxLayout(self)
+        prompt = QtWidgets.QLabel("What do you want to calibrate?", self)
+        prompt.setAlignment(Qt.AlignCenter)
+        layout.addWidget(prompt)
+
+        row = QtWidgets.QHBoxLayout()
+        self.distance_btn = QtWidgets.QPushButton("Distance", self)
+        self.tension_btn  = QtWidgets.QPushButton("Tension", self)
+        row.addWidget(self.distance_btn)
+        row.addWidget(self.tension_btn)
+        layout.addLayout(row)
+
+        self.distance_btn.clicked.connect(self.pick_distance)
+        self.tension_btn.clicked.connect(self.pick_tension)
+
+    def pick_distance(self):
+        self.selection = "distance"
+        self.accept()
+
+    def pick_tension(self):
+        self.selection = "tension"
+        self.accept()
 
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
