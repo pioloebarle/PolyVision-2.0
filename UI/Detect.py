@@ -16,7 +16,7 @@ from PyQt5 import QtCore
 from PyQt5.QtCore import *
 from PyQt5.uic import loadUi
 from bbox import BoundingBox
-from localization import Detector, loadModel, initialize_models, is_models_ready
+from localization import Detector, loadModel, initialize_models, is_models_ready, is_model_loading
 
 class DetectUI(QDialog):
     close_signal = pyqtSignal()
@@ -91,7 +91,18 @@ class DetectUI(QDialog):
     def detect_mp(self):
         # Check if models are ready using the global state
         if not is_models_ready():
-            QMessageBox.warning(self, "Models Not Ready", "Models are still loading. Please wait a moment and try again.")
+            if is_model_loading():
+                QMessageBox.warning(
+                    self,
+                    "Models Not Ready",
+                    "The selected model is still loading in the background. Please wait a moment and try again.",
+                )
+            else:
+                QMessageBox.warning(
+                    self,
+                    "Models Not Ready",
+                    "Models are not ready yet. They will be loaded automatically; please try again shortly.",
+                )
             return
         
         # Check if image is selected
