@@ -5,6 +5,7 @@ import numpy as np
 import json
 import torch
 import time
+import threading
 from PIL import Image
 from InferenceBinary import Binary
 from InferenceMulticlass import Multiclass
@@ -12,74 +13,113 @@ from InferenceMulticlass import Multiclass
 # GLOBAL VARIABLES FOR MODEL MANAGEMENT
 GLOBAL_BINARY_DETECTOR = None
 GLOBAL_MULTICLASS_DETECTOR = None
-MODELS_INITIALIZED = False
 
-def initialize_models():
-    global GLOBAL_BINARY_DETECTOR, GLOBAL_MULTICLASS_DETECTOR, MODELS_INITIALIZED
-    
-    if MODELS_INITIALIZED:
-        print("Models already initialized, skipping...")
-        return True
-    
-    print("Initializing models at startup...")
-    start_time = time.perf_counter()
-    
-    try:
-        # Preload Binary model
-        print("Loading Binary model...")
-        binary_start = time.perf_counter()
-        GLOBAL_BINARY_DETECTOR = Binary()
-        binary_end = time.perf_counter()
-        print(f"Binary model loaded in {binary_end - binary_start:.3f} seconds")
-        
-        # Preload Multiclass model
-        print("Loading Multiclass model...")
-        multi_start = time.perf_counter()
-        GLOBAL_MULTICLASS_DETECTOR = Multiclass()
-        multi_end = time.perf_counter()
-        print(f"Multiclass model loaded in {multi_end - multi_start:.3f} seconds")
-        
-        torch.set_num_threads(6)  
-        
-        MODELS_INITIALIZED = True
-        total_time = time.perf_counter() - start_time
-        print(f"All models initialized successfully in {total_time:.3f} seconds")
-        
-        return True
-        
-    except Exception as e:
-        print(f"Error initializing models: {e}")
-        GLOBAL_BINARY_DETECTOR = None
-        GLOBAL_MULTICLASS_DETECTOR = None
-        MODELS_INITIALIZED = False
-        return False
+_MODEL_STATUS_LOCK = threading.Lock()
+_MODEL_STATUS = {
+    "Binary": {"loaded": False, "loading": False, "error": None},
+    "Multiclass": {"loaded": False, "loading": False, "error": None},
+}
+
+def initialize_models(model_types=None):
+    """
+    Lazily initialize one or more models. When model_types is None, both
+    detectors are loaded (previous behaviour). Returns True when all requested
+    models are ready.
+    """
+    global GLOBAL_BINARY_DETECTOR, GLOBAL_MULTICLASS_DETECTOR
+
+    if model_types is None:
+        target_models = ["Binary", "Multiclass"]
+    elif isinstance(model_types, str):
+        target_models = [model_types]
+    else:
+        target_models = list(model_types)
+
+    success = True
+
+    for model_type in target_models:
+        if model_type not in _MODEL_STATUS:
+            print(f"Unknown model type requested: {model_type}")
+            success = False
+            continue
+
+        # Wait for an in-flight load to complete before deciding what to do
+        while True:
+            with _MODEL_STATUS_LOCK:
+                status = _MODEL_STATUS[model_type]
+                if status["loaded"]:
+                    break
+                if not status["loading"]:
+                    status["loading"] = True
+                    status["error"] = None
+                    break
+            # Another thread is loading this model – wait briefly
+            time.sleep(0.05)
+
+        with _MODEL_STATUS_LOCK:
+            status = _MODEL_STATUS[model_type]
+            if status["loaded"]:
+                continue
+
+        print(f"Loading {model_type} model...")
+        model_start = time.perf_counter()
+
+        try:
+            if model_type == "Binary":
+                detector = Binary()
+                if not detector.is_ready():
+                    raise RuntimeError("Binary detector failed to report ready")
+                GLOBAL_BINARY_DETECTOR = detector
+            elif model_type == "Multiclass":
+                detector = Multiclass()
+                if not detector.is_ready():
+                    raise RuntimeError("Multiclass detector failed to report ready")
+                GLOBAL_MULTICLASS_DETECTOR = detector
+
+            model_end = time.perf_counter()
+            print(f"{model_type} model loaded in {model_end - model_start:.3f} seconds")
+            with _MODEL_STATUS_LOCK:
+                status = _MODEL_STATUS[model_type]
+                status["loaded"] = True
+                status["error"] = None
+        except Exception as e:
+            print(f"Error loading {model_type} model: {e}")
+            with _MODEL_STATUS_LOCK:
+                status = _MODEL_STATUS[model_type]
+                status["loaded"] = False
+                status["error"] = str(e)
+            success = False
+        finally:
+            with _MODEL_STATUS_LOCK:
+                _MODEL_STATUS[model_type]["loading"] = False
+
+    if success:
+        torch.set_num_threads(6)
+
+    return success
 
 def get_current_detector():
     """
-    Get the appropriate detector based on current settings
-    No model loading - just returns the preloaded model
+    Get the appropriate detector based on current settings.
+    If the detector is not ready, attempt to load it on demand.
     """
-    global GLOBAL_BINARY_DETECTOR, GLOBAL_MULTICLASS_DETECTOR, MODELS_INITIALIZED
-    
-    # Ensure models are initialized
-    if not MODELS_INITIALIZED:
-        print("Models not initialized, initializing now...")
-        if not initialize_models():
-            return None
-    
-    # Get model type from settings
     model_type = get_model_type_from_settings()
-    
+
+    if not is_models_ready(model_type):
+        print(f"{model_type} model not ready, initializing now...")
+        if not initialize_models(model_type):
+            return None
+
     if model_type == "Binary":
         if GLOBAL_BINARY_DETECTOR is None:
             print("Error: Binary detector is None")
             return None
         return GLOBAL_BINARY_DETECTOR
-    else:  # Multiclass
-        if GLOBAL_MULTICLASS_DETECTOR is None:
-            print("Error: Multiclass detector is None")
-            return None
-        return GLOBAL_MULTICLASS_DETECTOR
+
+    if GLOBAL_MULTICLASS_DETECTOR is None:
+        print("Error: Multiclass detector is None")
+        return None
+    return GLOBAL_MULTICLASS_DETECTOR
 
 def get_model_type_from_settings():
     try:
@@ -98,13 +138,13 @@ def loadModel(image_input):
     """
     Enhanced loadModel that accepts both file paths and PIL Images
     """
-    # Ensure models are initialized
-    if not MODELS_INITIALIZED:
-        print("Models not initialized, initializing now...")
-        if not initialize_models():
+    model_type = get_model_type_from_settings()
+
+    if not is_models_ready(model_type):
+        print(f"{model_type} model not ready, initializing now...")
+        if not initialize_models(model_type):
             return None
-    
-    # Get preloaded detector (no model loading here)
+
     detector = get_current_detector()
     if detector is None:
         print("Error: Could not get detector")
@@ -167,14 +207,7 @@ class LocalDetectMP():
                     print("Failed to get prediction results")
                     
             elif isinstance(image_input, Image.Image):
-                temp_path = "temp_image.jpg"
-                image_input.save(temp_path)
-                
-                detections = loadModel(temp_path)
-                
-                # Clean up temporary file
-                if os.path.exists(temp_path):
-                    os.remove(temp_path)
+                detections = loadModel(image_input)
                 
                 if detections is not None:
                     self.result = detections
@@ -201,6 +234,11 @@ def imageDetection(image_path, confidence=0.7, save_result=True, model_type=None
             print(f"Could not find image: {image_path}")
             return None
         
+        if model_type is not None and model_type in _MODEL_STATUS:
+            if not is_models_ready(model_type):
+                print(f"{model_type} model requested for image detection; initializing...")
+                if not initialize_models(model_type):
+                    return None
         
         detections = loadModel(image_path)
         
@@ -255,8 +293,8 @@ def switch_model(new_model_type):
         
         with open("user_settings.json", 'w') as f:
             json.dump(settings, f, indent=4)
-            
-        print(f"Switched to {new_model_type} model (no reloading needed)")
+        
+        print(f"Switched to {new_model_type} model (will load on demand if needed)")
         return True
         
     except Exception as e:
@@ -266,8 +304,23 @@ def switch_model(new_model_type):
 def get_current_model_type():
     return get_model_type_from_settings()
 
-def is_models_ready():
-    return MODELS_INITIALIZED and GLOBAL_BINARY_DETECTOR is not None and GLOBAL_MULTICLASS_DETECTOR is not None
+def is_models_ready(model_type=None):
+    if model_type is None:
+        model_type = get_model_type_from_settings()
+    with _MODEL_STATUS_LOCK:
+        status = _MODEL_STATUS.get(model_type)
+        if status is None:
+            return False
+        return status["loaded"]
+
+def is_model_loading(model_type=None):
+    if model_type is None:
+        model_type = get_model_type_from_settings()
+    with _MODEL_STATUS_LOCK:
+        status = _MODEL_STATUS.get(model_type)
+        if status is None:
+            return False
+        return status["loading"]
 
 
 if __name__ == "__main__":
