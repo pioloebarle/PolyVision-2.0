@@ -37,7 +37,7 @@ import threading
 from VerificationMessageBox import VerificationBox
 from collections import deque
 import winsound
-from localization import LocalDetectMP, loadModel, initialize_models
+from localization import LocalDetectMP, loadModel, initialize_models, is_models_ready, is_model_loading
 
 class Ui_MainWindow(QMainWindow):
     
@@ -75,7 +75,8 @@ class Ui_MainWindow(QMainWindow):
         self.grbl_settings = self.settings_data.get("grbl_settings", {})
         self.general_settings = self.settings_data.get("general_features", {})
         self.model_port = 0  # Separate variable for model type (0=Binary, 1=Multiclass)
-        if self.general_settings["model"] == "Binary":
+        self.current_model_type = self.general_settings.get("model", "Binary")
+        if self.current_model_type == "Binary":
             self.model_port = 0
         else:
             self.model_port = 1
@@ -519,15 +520,22 @@ class Ui_MainWindow(QMainWindow):
         self.retrain.exec_()
 
     def refreshSettings(self):
+        previous_model_type = getattr(self, "current_model_type", self.current_model_type)
         with open("user_settings.json", "r") as f:
                 self.settings_data = json.load(f)
                 self.image_settings = self.settings_data.get("image_settings", {})
                 self.grbl_settings = self.settings_data.get("grbl_settings", {})
                 self.general_settings = self.settings_data.get("general_features", {})
-                if self.general_settings["model"] == "Binary":
+                new_model_type = self.general_settings.get("model", "Binary")
+                if new_model_type == "Binary":
                     self.model_port = 0
                 else:
                     self.model_port = 1
+        self.current_model_type = new_model_type
+        if new_model_type != previous_model_type:
+            print(f"Model selection changed from {previous_model_type} to {new_model_type}.")
+            if hasattr(self, "_host_mainwindow") and self._host_mainwindow is not None:
+                self._host_mainwindow.handle_model_selection_change(new_model_type)
    
     def goToCurrentImages(self):
         self.paused = True
@@ -1200,6 +1208,7 @@ class Ui_MainWindow(QMainWindow):
 
     #defining pyQt5 widgets
     def setupUi(self, MainWindow):
+        self._host_mainwindow = MainWindow
         MainWindow.setObjectName("MainWindow")
         MainWindow.showMaximized()
         MainWindow.setStyleSheet("background-color: rgb(255, 255, 255);")
@@ -1845,7 +1854,7 @@ class Ui_MainWindow(QMainWindow):
             results = []  # (label, bool)
 
             def ask_alignment(label):
-                res = self.verificationBox("Is the crosshair aligned to the grid?")
+                res = self.verificationBox("Is the crosshair aligned to the center after moving?")
                 if res == 0:          # X clicked -> cancel the sequence
                     return False
                 aligned = (res == 1)  # 1 = Yes, 2 = No
@@ -1854,35 +1863,35 @@ class Ui_MainWindow(QMainWindow):
                 return True
 
 
-            travel_steps = 1  
+            travel_steps = 3  
 
             self.moveToGridCenter()
 
             self.moveLeftSteps(travel_steps)
-            if not ask_alignment("Left"): return
+            # if not ask_alignment("Left"): return
             
             self.moveRightSteps(travel_steps)
             if not ask_alignment("Center After Left"): return
 
-            self.moveRightSteps(travel_steps)
-            if not ask_alignment("Right"): return
+            # self.moveRightSteps(travel_steps)
+            # if not ask_alignment("Right"): return
             
-            self.moveLeftSteps(travel_steps)
-            if not ask_alignment("Center After Right"): return
+            # self.moveLeftSteps(travel_steps)
+            # if not ask_alignment("Center After Right"): return
 
             self.moveUpSteps(travel_steps)
-            if not ask_alignment("Up"): return
+            # if not ask_alignment("Up"): return
             
             self.moveDownSteps(travel_steps)
             if not ask_alignment("Center After Up"): return
 
-            self.moveDownSteps(travel_steps)
-            if not ask_alignment("Down"): return
+            # self.moveDownSteps(travel_steps)
+            # if not ask_alignment("Down"): return
             
-            self.moveUpSteps(travel_steps)
-            if not ask_alignment("Center After Down"): return
+            # self.moveUpSteps(travel_steps)
+            # if not ask_alignment("Center After Down"): return
 
-            self.moveToGridCenter()
+            # self.moveToGridCenter()
 
             no_count = sum(1 for _, ok in results if not ok)
             status = "FAILED" if no_count >= 2 else "PASSED"
@@ -2385,41 +2394,98 @@ class CalibrationChoiceDialog(QtWidgets.QDialog):
         self.selection = "tension"
         self.accept()
 
+class ModelLoaderThread(QtCore.QThread):
+    finished = QtCore.pyqtSignal(bool)
+
+    def __init__(self, model_types, warmup_callback=None, parent=None):
+        super().__init__(parent)
+        if isinstance(model_types, str):
+            self.model_types = [model_types]
+        else:
+            self.model_types = list(model_types)
+        self._warmup_callback = warmup_callback
+        # Track the primary model requested so callers can detect duplicates.
+        self.primary_model = self.model_types[0] if self.model_types else None
+
+    def run(self):
+        success = initialize_models(self.model_types)
+        if success and self._warmup_callback:
+            try:
+                self._warmup_callback()
+            except Exception as warmup_error:
+                print(f"Warning: Model warmup failed: {warmup_error}")
+        self.finished.emit(success)
+
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super(MainWindow, self).__init__()
         self.ui = Ui_MainWindow()
 
         self.ui.setupUi(self)
-        
-        # Pre-load AI models for faster first detection
-        print("Pre-loading AI models for optimal performance...")
-        try:
-            initialize_models()
-            print("Models pre-loaded successfully!")
-            
-            self.warmup_models()
-            
-        except Exception as e:
-            print(f"Warning: Model pre-loading failed: {e}")
-            print("Models will be loaded on first detection")
+        self.model_loader_thread = None
+        self.model_preload_complete = False
+        self._pending_model_type = None
+        self.current_model_type = self.ui.general_settings.get("model", "Binary")
+
+        self._start_model_preload(self.current_model_type)
+
+    def _start_model_preload(self, model_type=None):
+        target_model = model_type or self.ui.general_settings.get("model", "Binary")
+        print(f"Pre-loading {target_model} model in background for optimal performance...")
+        self.model_preload_complete = False
+
+        if is_models_ready(target_model):
+            print(f"{target_model} model already loaded; skipping background preload.")
+            self.model_preload_complete = True
+            return
+
+        if is_model_loading(target_model):
+            print(f"{target_model} model is already being loaded by another worker.")
+            return
+
+        if self.model_loader_thread and self.model_loader_thread.isRunning():
+            running_model = getattr(self.model_loader_thread, "primary_model", None)
+            if running_model == target_model:
+                print(f"{target_model} model is currently loading via existing worker.")
+                return
+            print(f"Background loader busy; queuing request to load {target_model}.")
+            self._pending_model_type = target_model
+            return
+
+        self.model_loader_thread = ModelLoaderThread(
+            model_types=target_model,
+            warmup_callback=self.warmup_models
+        )
+        self.model_loader_thread.finished.connect(self._on_model_preload_finished)
+        self.model_loader_thread.start()
+
+    def handle_model_selection_change(self, new_model_type):
+        if new_model_type == self.current_model_type:
+            return
+        print(f"Main window updating model selection: {self.current_model_type} -> {new_model_type}")
+        self.current_model_type = new_model_type
+        self._start_model_preload(new_model_type)
+
+    def _on_model_preload_finished(self, success):
+        self.model_preload_complete = success
+        if success:
+            print("Model pre-loading completed in the background.")
+        else:
+            print("Model pre-loading failed; models will be loaded on demand.")
+        self.model_loader_thread = None
+        if self._pending_model_type:
+            pending = self._pending_model_type
+            self._pending_model_type = None
+            if not is_models_ready(pending) and not is_model_loading(pending):
+                self._start_model_preload(pending)
 
     def warmup_models(self):
         print("Warming up models with dummy inference...")
         try:
-            import numpy as np
-
-            dummy_image = np.zeros((224, 224, 3), dtype=np.uint8)  
-
-            temp_image_path = "temp_warmup_image.jpg"
-            cv2.imwrite(temp_image_path, dummy_image)
-
+            dummy_image = Image.new("RGB", (224, 224), color=0)
             start_time = time.time()
-            _ = loadModel(temp_image_path)  
+            _ = loadModel(dummy_image)
             warmup_time = time.time() - start_time
-
-            if os.path.exists(temp_image_path):
-                os.remove(temp_image_path)
             
             print(f"Model warmup completed in {warmup_time:.3f} seconds")
             print("Models are now ready for optimal performance!")
@@ -2429,6 +2495,9 @@ class MainWindow(QtWidgets.QMainWindow):
             print("Models will still work but first detection may be slower")
 
     def closeEvent(self, event):
+        if self.model_loader_thread and self.model_loader_thread.isRunning():
+            self.model_loader_thread.wait(2000)
+
         if hasattr(self.ui, 'VideoCapture') and self.ui.VideoCapture is not None:
             self.ui.VideoCapture.ThreadActive = False
             self.ui.VideoCapture.stop()
