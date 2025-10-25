@@ -465,10 +465,19 @@ class RetrainingThread(QThread):
             if is_mp == 1 and bbox_str:
                 try:
                     bboxes_list = json.loads(bbox_str)
+                    if not isinstance(bboxes_list, list):
+                        bboxes_list = []
                     for ann_idx, bbox_info in enumerate(bboxes_list):
-                        x1, y1, x2, y2 = bbox_info['bbox']
+                        if not isinstance(bbox_info, dict):
+                            continue
+                        if bbox_info.get("review_status") == "rejected":
+                            continue
+                        bbox = bbox_info.get('bbox')
+                        if not bbox or len(bbox) != 4:
+                            continue
+                        x1, y1, x2, y2 = bbox
                         w, h = x2 - x1, y2 - y1
-                        category_id = bbox_info['class_id']
+                        category_id = bbox_info.get('class_id', 1)
                         final_coco["annotations"].append({
                             "id": new_annotations_count + annotation_id_offset, "image_id": new_image_id,
                             "category_id": category_id, "bbox": [x1, y1, w, h], "area": w * h, "iscrowd": 0
@@ -824,7 +833,8 @@ class RetrainUI(QDialog):
                 bboxes = json.loads(bbox_str)
                 if isinstance(bboxes, list):
                     for bbox_info in bboxes:
-                        all_class_ids.append(bbox_info.get("class_id", 0))
+                        if isinstance(bbox_info, dict):
+                            all_class_ids.append(bbox_info.get("class_id", 0))
             except (json.JSONDecodeError, TypeError):
                 continue
         if all_class_ids:
@@ -840,8 +850,13 @@ class RetrainUI(QDialog):
                 if is_db_multiclass:
                     try:
                         bboxes = json.loads(bbox_str)
-                        if isinstance(bboxes, list) and len(bboxes) > 0:
-                            multiclass_ready_count += 1
+                        if isinstance(bboxes, list):
+                            has_valid_bbox = any(
+                                isinstance(bbox_info, dict) and bbox_info.get("bbox")
+                                for bbox_info in bboxes
+                            )
+                            if has_valid_bbox:
+                                multiclass_ready_count += 1
                     except (json.JSONDecodeError, TypeError):
                         pass
             else:
