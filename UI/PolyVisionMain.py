@@ -35,6 +35,8 @@ from CalibrationUI import CalibrateUI
 from CoordinateUI import CoordinateUI
 import threading
 from VerificationMessageBox import VerificationBox
+from AnnotationReviewDialog import AnnotationReviewDialog
+from PIL.ImageQt import ImageQt
 from collections import deque
 import winsound
 from localization import LocalDetectMP, loadModel, initialize_models, is_models_ready, is_model_loading
@@ -167,9 +169,6 @@ class Ui_MainWindow(QMainWindow):
     def captureClose(self):
         self.VideoCapture.start()
         self.paused = False
-        # Resume AutoScan if it was running
-        # if self.autoScanning is not None and hasattr(self.autoScanning, 'event'):
-        #     self.autoScanning.event.set()
       
     def captureCurrentFrame(self):
         pixmap = self.graphicsView.pixmap()
@@ -243,7 +242,7 @@ class Ui_MainWindow(QMainWindow):
             print("Exception occurred saving image:", e)
 
         
-    def retrainSave(self, frame, isMP, bounding_box):
+    def retrainSave(self, frame, annotations, is_microplastic=None):
         current_directory = os.path.dirname(os.path.abspath(__file__))
         save_folder = "retrainingImages"
         if not os.path.exists(save_folder):
@@ -255,9 +254,65 @@ class Ui_MainWindow(QMainWindow):
         image_name = f"image_{current_row_number}.png"
         # Save the image using Pillow (PIL)
         frame.save(os.path.join(save_path, image_name))
-        bounding_box_str = json.dumps(bounding_box)
+        bounding_box_str = json.dumps(annotations)
+        if is_microplastic is None:
+            is_microplastic = bool(annotations)
+        is_microplastic = 1 if is_microplastic else 0
         # Now call retrain_data with the image name
-        retrain_data(current_directory, image_name, isMP, bounding_box_str)
+        retrain_data(current_directory, image_name, is_microplastic, bounding_box_str)
+        
+    def getAnnotationClass(self, detections=None):
+
+        choices = []
+        model_type = self.current_model_type
+        if model_type == "Multiclass":
+            choices = [
+                (1, "Filament"),
+                (2, "Film"),
+                (3, "Fragment"),
+            ]
+        else:
+            # Binary model: background vs. microplastic
+            choices = [
+                (1, "Microplastic"),
+                (0, "Background"),
+            ]
+
+        if detections:
+            known_ids = {value for value, _ in choices}
+            for det in detections:
+                det_id = det.get("class_id")
+                if det_id is not None and det_id not in known_ids:
+                    choices.append((det_id, f"Class {det_id}"))
+                    known_ids.add(det_id)
+        return choices
+
+    def AnnotationReview(self, preview_image, detections):
+        detections = detections or []
+        class_choices = self.getAnnotationClass(detections)
+        dialog = AnnotationReviewDialog(preview_image, detections, class_choices, self)
+        if dialog.exec_() == QDialog.Accepted:
+            accepted = dialog.accepted_annotations()
+            if accepted:
+                return accepted, True
+            if detections:
+                rejected = []
+                for det in detections:
+                    if isinstance(det, dict):
+                        item = dict(det)
+                        item["review_status"] = item.get("review_status", "rejected")
+                        rejected.append(item)
+                return rejected, False
+            return [], False
+        return None
+
+    def SaveNegativeSample(self, frame, detections=None):
+        dialog = VerificationBox("Save this frame as a negative sample for retraining?")
+        if dialog.exec_() == QDialog.Accepted:
+            annotations = detections if detections is not None else []
+            self.retrainSave(frame, annotations, is_microplastic=False)
+            return True
+        return False
         
     def onLengthClicked(self):
         self.capture.hide()
@@ -280,12 +335,6 @@ class Ui_MainWindow(QMainWindow):
            if not self.measuring:
                 if not self.capturing:
                     self.frame = self.captureCurrentFrame()
-                    # Use stored original frame if in AutoScan mode, otherwise capture current frame
-                    # if hasattr(self, 'original_autoscan_frame') and self.original_autoscan_frame is not None:
-                    #     self.frame = self.original_autoscan_frame
-                    #     print("Using stored original AutoScan frame for measuring")
-                    # else:
-                    #     self.frame = self.captureCurrentFrame()
                 self.measuring = True
                 self.measureButton.setEnabled(True)
                 self.points = []
@@ -303,7 +352,10 @@ class Ui_MainWindow(QMainWindow):
         self.measuring = False
         self.measureButton.setText("Measure")
         QApplication.setOverrideCursor(QCursor(Qt.ArrowCursor))
-        self.paused = False
+        if self.capturing:
+            self.paused = True
+        else:
+            self.paused = False
         self.lengthLabel.setVisible(False)
         if self.capturing and self.measuring != True:
             if self.lengthClicked == 1:
@@ -386,14 +438,12 @@ class Ui_MainWindow(QMainWindow):
             chooser = CalibrationChoiceDialog(self)
             if chooser.exec_() == QtWidgets.QDialog.Accepted:
                 if chooser.selection == "distance":
-                    # keep your existing distance calibration behavior
                     self.calibrating = True
                     self.measuring = False
-                    self.measureLength()  # leads to calculatePixelDistanceRation() -> CalibrateUI
+                    self.measureLength()  
                 elif chooser.selection == "tension":
                     self.calibrateTension()
             else:
-                # user cancelled
                 if self.settings is not None:
                     self.settings.show()
         except Exception as e:
@@ -419,8 +469,6 @@ class Ui_MainWindow(QMainWindow):
                 self.stopMeasureLength()
             except ValueError:
                 self.stopMeasureLength()
-
-            
 
             file_path = "user_settings.json"  
             settings_data = {} 
@@ -541,7 +589,7 @@ class Ui_MainWindow(QMainWindow):
         self.paused = True
         self.images = ImagesUI(self.file_name)
         continued = self.images.exec_()
-        if continued == QDialog.Rejected :
+        if continued == QDialog.Rejected:
             self.setPausedFalse()
 
     def goToStatistics(self):
@@ -908,8 +956,7 @@ class Ui_MainWindow(QMainWindow):
                 winsound.Beep(800, 500)
                 winsound.Beep(800, 500)
                 winsound.Beep(800, 750)
-            
-            # Original score categorization logic - DO NOT CHANGE
+
             low = 0
             med = 0
             high = 0
@@ -934,7 +981,6 @@ class Ui_MainWindow(QMainWindow):
             qpixmap = QPixmap.fromImage(qimage)
             scaled = qpixmap.scaled(1280,720)
             self.graphicsView.setPixmap(scaled)
-            # self.graphicsView.setScaledContents(True)
             dialog = VerificationBox("Microplastic Found. Capture Image?") 
             continued = dialog.exec_()    
             if continued == QDialog.Accepted:
@@ -945,13 +991,23 @@ class Ui_MainWindow(QMainWindow):
                     qpixmap = QPixmap.fromImage(currentFrame)
                     image = Image.fromqimage(qpixmap)
                     self.graphicsView.setPixmap(qpixmap)
-                    self.captureButtonClicked()
-                    self.retrainSave(currentFrame, True, detector.get_json()) #frame, bool, bounding box
+                    review_result = self.AnnotationReview(ImageQt(sized).copy(), detector.get_json())
+                    if review_result is not None:
+                        annotations, is_positive = review_result
+                        self.retrainSave(currentFrame, annotations, is_microplastic=is_positive)
+                        self.captureButtonClicked()
+                    else:
+                        self.paused = False
+                        self.statusValue.setText("Idle")
+                        if 'video_was_active' in locals() and video_was_active and self.VideoCapture is not None:
+                            if hasattr(self.VideoCapture, 'set_detection_priority'):
+                                self.VideoCapture.set_detection_priority(False)
+                        return
                 else:
-                    self.retrainSave(currentFrame, False, detector.get_json()) #frame, bool, bounding box
+                    self.SaveNegativeSample(currentFrame, detector.get_json())
                     self.paused = False
             else:
-                self.retrainSave(currentFrame, False, detector.get_json()) #frame, bool, bounding box
+                self.SaveNegativeSample(currentFrame, detector.get_json())
                 self.paused = False
 
             if video_was_active and self.VideoCapture is not None:
@@ -964,15 +1020,14 @@ class Ui_MainWindow(QMainWindow):
             print(f"No detections found")
             print(f"Total scanning time: {total_scan_time:.3f} seconds")
             
-            self.retrainSave(currentFrame, True, detector.get_json()) #frame, bool, bounding box
+            self.SaveNegativeSample(currentFrame, detector.get_json())
             
             if video_was_active and self.VideoCapture is not None:
                 if hasattr(self.VideoCapture, 'set_detection_priority'):
                     self.VideoCapture.set_detection_priority(False)
             self.paused = False
-        self.statusValue.setText("Idle")
             
-
+        self.statusValue.setText("Idle")
 
     def autoFocus(self):
         self.autoFocusing.updateThread(False)
@@ -1005,9 +1060,7 @@ class Ui_MainWindow(QMainWindow):
         self.paused = True #pause 
 
         # Uses the resized PIL Image
-        start_detect = time.perf_counter()
         detections = loadModel(sized)    
-        end_detect = time.perf_counter()
         
         # DEBUG: Confirm model selection
         model_name = "Binary" if self.model_port == 0 else "Multiclass"
@@ -1050,7 +1103,6 @@ class Ui_MainWindow(QMainWindow):
             qpixmap = QPixmap.fromImage(qimage)
             scaled = qpixmap.scaled(1280,720)
             self.graphicsView.setPixmap(scaled)
-            # self.graphicsView.setScaledContents(True)
             dialog = VerificationBox("Microplastic Found. Capture Image?") 
             continued = dialog.exec_()    
             if continued == QDialog.Accepted:     
@@ -1061,14 +1113,28 @@ class Ui_MainWindow(QMainWindow):
                     qpixmap = QPixmap.fromImage(currentFrame)
                     image = Image.fromqimage(qpixmap)
                     self.graphicsView.setPixmap(qpixmap)
-                    self.captureDone = self.captureButtonClicked()
-                    self.retrainSave(currentFrame, True, detector.get_json()) #frame, bool, bounding box
+                    review_result = self.AnnotationReview(ImageQt(sized).copy(), detector.get_json())
+                    if review_result is not None:
+                        annotations, is_positive = review_result
+                        self.retrainSave(currentFrame, annotations, is_microplastic=is_positive)
+                        self.captureDone = self.captureButtonClicked()
+                        if self.autoScanning is not None and hasattr(self.autoScanning, 'event'):
+                            self.autoScanning.event.set()
+                    else:
+                        self.paused = False
+                        self.statusValue.setText("Scanning")
+                        if self.autoScanning is not None and hasattr(self.autoScanning, 'event'):
+                            self.autoScanning.event.set()
+                        if 'video_was_active' in locals() and video_was_active and self.VideoCapture is not None:
+                            if hasattr(self.VideoCapture, 'set_detection_priority'):
+                                self.VideoCapture.set_detection_priority(False)
+                        return
                 else:
-                    self.retrainSave(currentFrame, False, detector.get_json()) #frame, bool, bounding box
+                    self.SaveNegativeSample(currentFrame, detector.get_json())
                     self.autoScanning.event.set()
                     self.paused = False 
             else:
-                self.retrainSave(currentFrame, False, detector.get_json()) #frame, bool, bounding box
+                self.SaveNegativeSample(currentFrame, detector.get_json())
                 self.autoScanning.event.set()
                 self.paused = False
 
@@ -1082,7 +1148,7 @@ class Ui_MainWindow(QMainWindow):
             print(f"No detections found")
             print(f"Total scanning time: {total_scan_time:.3f} seconds")
             
-            self.retrainSave(currentFrame, False, "") #frame, bool, bounding box
+            self.SaveNegativeSample(currentFrame, detector.get_json())
             # Restart video capture after detection
             if video_was_active and self.VideoCapture is not None:
                 if hasattr(self.VideoCapture, 'set_detection_priority'):
@@ -1713,7 +1779,7 @@ class Ui_MainWindow(QMainWindow):
         try:
             dialog = QDialog(self)
             dialog.setWindowTitle("Tension Calibration")
-            dialog.setFixedSize(250, 100)
+            dialog.setFixedSize(250, 120)
 
             layout = QVBoxLayout(dialog)
             layout.setContentsMargins(20, 15, 20, 15)
@@ -1862,36 +1928,19 @@ class Ui_MainWindow(QMainWindow):
                 time.sleep(0.05)
                 return True
 
-
-            travel_steps = 3  
+            travel_steps = 5  
 
             self.moveToGridCenter()
 
             self.moveLeftSteps(travel_steps)
-            # if not ask_alignment("Left"): return
-            
+            time.sleep(1.5)
             self.moveRightSteps(travel_steps)
             if not ask_alignment("Center After Left"): return
 
-            # self.moveRightSteps(travel_steps)
-            # if not ask_alignment("Right"): return
-            
-            # self.moveLeftSteps(travel_steps)
-            # if not ask_alignment("Center After Right"): return
-
             self.moveUpSteps(travel_steps)
-            # if not ask_alignment("Up"): return
-            
+            time.sleep(1.5)
             self.moveDownSteps(travel_steps)
             if not ask_alignment("Center After Up"): return
-
-            # self.moveDownSteps(travel_steps)
-            # if not ask_alignment("Down"): return
-            
-            # self.moveUpSteps(travel_steps)
-            # if not ask_alignment("Center After Down"): return
-
-            # self.moveToGridCenter()
 
             no_count = sum(1 for _, ok in results if not ok)
             status = "FAILED" if no_count >= 2 else "PASSED"
@@ -1907,7 +1956,7 @@ class Ui_MainWindow(QMainWindow):
             if status == "PASSED":
                 remarks = "Alignment looks acceptable at most checkpoints."
             else:
-                remarks = "At least two checkpoints were misaligned. Adjust tension and try again."
+                remarks = "Adjust tension and try again."
             self.TensionSummary(f"Tension Calibration {status}", remarks, "\n".join(lines))
 
             completed = True
@@ -1928,7 +1977,6 @@ class Ui_MainWindow(QMainWindow):
                         self._hover_timer = None
                 except:
                     pass
-
 
     def moveToGridCenter(self):
         try:
@@ -2522,4 +2570,3 @@ if __name__ == "__main__":
     mainWindow = MainWindow()
     mainWindow.show()
     sys.exit(app.exec_())
-
