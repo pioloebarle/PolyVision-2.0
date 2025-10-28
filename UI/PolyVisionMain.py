@@ -165,10 +165,18 @@ class Ui_MainWindow(QMainWindow):
             return toReturn
         except:
             pass
-            
+    
     def captureClose(self):
-        self.VideoCapture.start()
+        if self.VideoCapture is not None:
+            self.VideoCapture.start()
+        self.capturing = False
         self.paused = False
+        self.scanButton.setEnabled(True)
+        if (self.autoScanning is not None and self.scanBTN.text() == "Continue"):
+            self.grblUP.setEnabled(True)
+            self.grblDOWN.setEnabled(True )
+            self.grblLEFT.setEnabled(True )
+            self.grblRIGHT.setEnabled(True )
       
     def captureCurrentFrame(self):
         pixmap = self.graphicsView.pixmap()
@@ -667,16 +675,22 @@ class Ui_MainWindow(QMainWindow):
                     string += " F" + str(self.grbl_settings["max_feedrate"]) + " \r\n"
                     toSend = string.encode('utf-8')
                     self.ser.write(toSend)
-                    self.y -= self.grbl_settings["steps_per_mm"]
-                    self.yValue.setText(str(self.y))
+                    self.y += self.grbl_settings["steps_per_mm"]
+                    display_y = -self.y
+                    if abs(float(display_y)) < 1e-6:
+                        display_y = 0.0
+                    self.yValue.setText(str(display_y))
             else:
                 if self.y != 0: 
                     string = "G21 G91 G1 Y-" + str(self.grbl_settings["steps_per_mm"])
                     string += " F" + str(self.grbl_settings["max_feedrate"]) + " \r\n"
                     toSend = string.encode('utf-8')
                     self.ser.write(toSend)
-                    self.y += self.grbl_settings["steps_per_mm"]
-                    self.yValue.setText(str(self.y))
+                    self.y -= self.grbl_settings["steps_per_mm"]
+                    display_y = -self.y
+                    if abs(float(display_y)) < 1e-6:
+                        display_y = 0.0
+                    self.yValue.setText(str(display_y))
     
     def moveDown(self):
         if self.ser:
@@ -687,15 +701,21 @@ class Ui_MainWindow(QMainWindow):
                     toSend = string.encode('utf-8')
                     self.ser.write(toSend)
                     self.y -= self.grbl_settings["steps_per_mm"]
-                    self.yValue.setText(str(self.y))
+                    display_y = -self.y
+                    if abs(float(display_y)) < 1e-6:
+                        display_y = 0.0
+                    self.yValue.setText(str(display_y))
             else:
                 if self.y != self.yLimit:
                     string = "G21 G91 G1 Y" + str(self.grbl_settings["steps_per_mm"])
                     string += " F" + str(self.grbl_settings["max_feedrate"]) + " \r\n"
                     toSend = string.encode('utf-8')
                     self.ser.write(toSend)
-                    self.y -= self.grbl_settings["steps_per_mm"]
-                    self.yValue.setText(str(self.y))
+                    self.y += self.grbl_settings["steps_per_mm"]
+                    display_y = -self.y
+                    if abs(float(display_y)) < 1e-6:
+                        display_y = 0.0
+                    self.yValue.setText(str(display_y))
                     
     def moveLeft(self):
         if self.ser:
@@ -705,7 +725,7 @@ class Ui_MainWindow(QMainWindow):
                     string += " F" + str(self.grbl_settings["max_feedrate"]) + " \r\n"
                     toSend = string.encode('utf-8')
                     self.ser.write(toSend)
-                    self.x -= self.grbl_settings["steps_per_mm"]
+                    self.x += self.grbl_settings["steps_per_mm"]
                     self.xValue.setText(str(self.x))
             else:
                  if self.x != 0:
@@ -747,8 +767,6 @@ class Ui_MainWindow(QMainWindow):
             pass
 
     def emergencyStop(self):
-        dialog = OkayMessageBox("Emergency Stop, resets all progress.")
-        result = dialog.exec_()
         
         if self.autoFocusing is not None:
             self.autoFocusing.updateThread(False)
@@ -783,6 +801,7 @@ class Ui_MainWindow(QMainWindow):
             self.grblzDOWN.setEnabled(True )
             self.focusBTN.setEnabled(True )
             self.grblHOME.setEnabled(True)
+            self.scanButton.setVisible(False)
             self.statusValue.setText("Idle")
             self.detectionValue.setText("OFF")
             self.progressBar.setProperty("value", 0)
@@ -791,9 +810,10 @@ class Ui_MainWindow(QMainWindow):
             self.moveHome()
             pass
         
+        dialog = OkayMessageBox("Emergency Stop, resets all progress.")
+        result = dialog.exec_()
         
         
-
     def autoScan(self):
         self.connectGRBL.setEnabled(False)
         self.grblUP.setEnabled(False)
@@ -804,6 +824,7 @@ class Ui_MainWindow(QMainWindow):
         self.grblzDOWN.setEnabled(False)
         self.focusBTN.setEnabled(False)
         self.grblHOME.setEnabled(False)
+        self.scanButton.setEnabled(False)
         self.detectionValue.setText("ON")
         self.statusValue.setText("Scanning")
         self.grbl.hide()
@@ -811,6 +832,7 @@ class Ui_MainWindow(QMainWindow):
         self.high = 0
         self.med = 0
         self.low = 0
+        self.scanButton.setVisible(True)
         self.scanBTN.setText("Continue")
         self.statusValue.setText("Scanning..")
         self.detectionValue.setText("ON")
@@ -893,12 +915,36 @@ class Ui_MainWindow(QMainWindow):
             # arr = arr[:, :, :3]
 
         return arr
-
+    
     def manualScanBTN(self):   
         if self.scanBTN.text() == "Continue":
             if self.autoScanning is not None:
+                target_x = getattr(self.autoScanning, "x", self.x)
+                target_y = getattr(self.autoScanning, "y", self.y)
+                delta_x = target_x - self.x
+                delta_y = target_y - self.y
+                if self.ser is not None and (abs(delta_x) >= 1e-6 or abs(delta_y) >= 1e-6):
+                    command_parts = ["G21", "G91", "G1"]
+                    if abs(delta_x) >= 1e-6:
+                        command_parts.append(f"X{-delta_x:.3f}")
+                    if abs(delta_y) >= 1e-6:
+                        command_parts.append(f"Y{delta_y:.3f}")
+                    feedrate = self.grbl_settings.get("max_feedrate", 1000)
+                    command_parts.append(f"F{feedrate}")
+                    command = " ".join(command_parts) + "\r\n"
+                    try:
+                        self.ser.write(command.encode("utf-8"))
+                    except Exception as e:
+                        print(f"Failed to realign AutoScan position: {e}")
+                self.x = target_x
+                self.y = target_y
+                self.xValue.setText(f"{self.x:.1f}")
+                self.yValue.setText(f"{-self.y:.1f}")
+            self.detectionValue.setText("ON")
+            if self.autoScanning is not None:
                 self.autoScanning.event.set()
         else:
+            self.scanButton.setVisible(False)
             self.manualScanMP()
 
     def manualScanMP(self):
@@ -1118,8 +1164,6 @@ class Ui_MainWindow(QMainWindow):
                         annotations, is_positive = review_result
                         self.retrainSave(currentFrame, annotations, is_microplastic=is_positive)
                         self.captureDone = self.captureButtonClicked()
-                        if self.autoScanning is not None and hasattr(self.autoScanning, 'event'):
-                            self.autoScanning.event.set()
                     else:
                         self.paused = False
                         self.statusValue.setText("Scanning")
@@ -1177,6 +1221,7 @@ class Ui_MainWindow(QMainWindow):
         self.grblzDOWN.setEnabled(True )
         self.focusBTN.setEnabled(True )
         self.grblHOME.setEnabled(True)
+        self.scanButton.setVisible(False)
         self.statusValue.setText("Idle")
         self.detectionValue.setText("OFF")
         verify = VerificationBox("Do you want to rescan?")
@@ -1187,6 +1232,7 @@ class Ui_MainWindow(QMainWindow):
         continued = verify.exec_()
         if continued == QDialog.Accepted:
             self.autoScan()
+            self.scanButton.setVisible(True)
         else:
             self.scanBTN.setText("Scan")
 
@@ -1407,6 +1453,7 @@ class Ui_MainWindow(QMainWindow):
         self.calibrateBTN       = QtWidgets.QPushButton(self.centralwidget)
         self.scanBTN            = QtWidgets.QPushButton(self.centralwidget)
         self.focusBTN           = QtWidgets.QPushButton(self.centralwidget)
+        self.scanButton         = QtWidgets.QPushButton(self.centralwidget) 
 
 
         #==================Stylesheets======================#
@@ -1444,6 +1491,7 @@ class Ui_MainWindow(QMainWindow):
         self.calibrateBTN.setStyleSheet("QPushButton {\n""    background-color: #fbbf16;\n""    color: #FFFFFF;\n""    font: bold 16px;\n""    border-radius: 10px;\n""    border-color: #fbbf16;\n""}\n""QPushButton:hover {\n""    background-color: #9e780e;\n""}")
         self.scanBTN.setStyleSheet("QPushButton {\n""    background-color: #fbbf16;\n""    color: #FFFFFF;\n""    font: bold 16px;\n""    border-radius: 10px;\n""    border-color: #fbbf16;\n""}\n""QPushButton:hover {\n""    background-color: #9e780e;\n""}")
         self.focusBTN.setStyleSheet("QPushButton {\n""    background-color: #fbbf16;\n""    color: #FFFFFF;\n""    font: bold 16px;\n""    border-radius: 10px;\n""    border-color: #fbbf16;\n""}\n""QPushButton:hover {\n""    background-color: #9e780e;\n""}")
+        self.scanButton.setStyleSheet("QPushButton {\n""    background-color: #fbbf16;\n""    color: #FFFFFF;\n""    font: bold 16px;\n""    border-radius: 10px;\n""    border-color: #fbbf16;\n""}\n""QPushButton:hover {\n""    background-color: #9e780e;\n""}")
        
         #======================BUTTON ACTIONS===========================#
         self.captureButton.clicked.connect(self.captureButtonClicked)
@@ -1467,7 +1515,8 @@ class Ui_MainWindow(QMainWindow):
         self.calibrateBTN.clicked.connect(self.calibrate)
         self.scanBTN.clicked.connect(self.manualScanBTN)
         self.focusBTN.clicked.connect(self.startFocusing)
-
+        self.scanButton.clicked.connect(self.manualScanMP)
+        
         #======================APP&LOGOS COORDNT========================#
         self.appTitle       .setGeometry(QtCore.QRect(100, 70, 140,40))
         self.appLogo         .setGeometry(QtCore.QRect(30, 60, 60, 50))
@@ -1503,6 +1552,7 @@ class Ui_MainWindow(QMainWindow):
         self.measureButton   .setGeometry(QtCore.QRect(1600, 480, 280, 35))
         self.calibrateBTN    .setGeometry(QtCore.QRect(1600, 520, 280, 35))
         self.scanBTN        .setGeometry(QtCore.QRect(1600, 560, 280, 35))
+        self.scanButton        .setGeometry(QtCore.QRect(1600, 870, 300, 35))
         #======================GRBL COORDINATES=========================#
         self.boxWidget       .setGeometry(QtCore.QRect(1595, 610, 300, 250))
         self.xWidget         .setGeometry(QtCore.QRect(1765, 690, 115, 150))
@@ -1601,7 +1651,7 @@ class Ui_MainWindow(QMainWindow):
         self.calibrateBTN.setText(_translate("MainWindow","Calibrate"))
         self.scanBTN.setText(_translate("MainWindow","Scan"))
         self.focusBTN.setText(_translate("MainWindow","Focus"))
-
+        self.scanButton.setText(_translate("MainWindow","Manual Scan"))
 
         #Menu Bar
         self.actionHelp.setText(_translate("MainWindow", "Help?"))
@@ -1634,7 +1684,7 @@ class Ui_MainWindow(QMainWindow):
         self.calibrateBTN.setEnabled(False)
         self.scanBTN.setEnabled(False)
         self.focusBTN.setEnabled(False)
-        
+        self.scanButton.setVisible(False)
         # Initially hide camera status label
         self.cameraStatusLabel.setVisible(False)
 
@@ -1676,20 +1726,14 @@ class Ui_MainWindow(QMainWindow):
             print("showLargeResultsDialog error:", e)
 
     def TensionSummary(self, title, remarks=None, details=None):
-        """Beautified summary dialog specifically for tension calibration.
-
-        remarks: optional short status/next steps line.
-        details: optional multiline report body.
-        """
         try:
-            # Backward compatibility: if only one text blob provided, treat it as the details.
             if details is None:
                 details = remarks or ""
                 remarks = None
 
             dialog = QDialog(self)
             dialog.setWindowTitle(title)
-            dialog.setFixedSize(400, 300)  # Smaller, more reasonable size
+            dialog.setFixedSize(400, 300)  
             
             layout = QVBoxLayout(dialog)
             layout.setContentsMargins(15, 15, 15, 15)
@@ -1802,25 +1846,20 @@ class Ui_MainWindow(QMainWindow):
             # Return distinct codes
             yes_btn.clicked.connect(lambda: dialog.done(1))  # YES
             no_btn.clicked.connect(lambda: dialog.done(2))   # NO
-            # Clicking the window "X" will return 0 automatically
 
-            # Position dialog (lower-left of graphicsView)
             graphics_rect = self.graphicsView.geometry()
             graphics_global_pos = self.graphicsView.mapToGlobal(self.graphicsView.rect().topLeft())
             dialog_x = graphics_global_pos.x() + 20
             dialog_y = graphics_global_pos.y() + graphics_rect.height() - dialog.height() - 20
             dialog.move(dialog_x, dialog_y)
 
-            return dialog.exec_()  # 1=Yes, 2=No, 0=X/close
+            return dialog.exec_()  
         except Exception as e:
             print(f"Error in tension verification dialog: {e}")
-            # Fallback: can't distinguish No vs X here, so treat as Accept/Reject
             return VerificationBox(message).exec_()
 
-
         except Exception as e:
             print(f"Error in tension verification dialog: {e}")
-            # Fallback to standard verification
             verify = VerificationBox(message)
             return verify.exec_()
     
@@ -1851,12 +1890,11 @@ class Ui_MainWindow(QMainWindow):
             # Connect button
             ok_btn.clicked.connect(dialog.accept)
 
-            # Position dialog (lower-left corner of the graphics view)
             graphics_rect = self.graphicsView.geometry()
             graphics_global_pos = self.graphicsView.mapToGlobal(self.graphicsView.rect().topLeft())
 
-            dialog_x = graphics_global_pos.x() + 20  # 20px from the left
-            dialog_y = graphics_global_pos.y() + graphics_rect.height() - dialog.height() - 20  # 20px from the bottom
+            dialog_x = graphics_global_pos.x() + 20  
+            dialog_y = graphics_global_pos.y() + graphics_rect.height() - dialog.height() - 20  
             dialog.move(dialog_x, dialog_y)
 
             # Show the dialog
@@ -1867,21 +1905,18 @@ class Ui_MainWindow(QMainWindow):
             return None
 
     def cancelCalibration(self):
-        # Check if 'Finish' is set, meaning calibration is in progress
         if self.calibrateBTN.text() == "Finish":
             self.calibrateBTN.setText("Calibrate")
-            self.show_grid = False  # Hide the grid
-            self._hover_pos = None  # Reset hover position
-            self.graphicsView.setMouseTracking(False)  # Disable mouse tracking
-            
+            self.show_grid = False  
+            self._hover_pos = None  
+            self.graphicsView.setMouseTracking(False)  
             try:
                 if hasattr(self, '_hover_timer') and self._hover_timer is not None:
-                    self._hover_timer.stop()  # Stop the hover timer
+                    self._hover_timer.stop()  
                     self._hover_timer = None
             except:
                 pass
-
-            self.paused = False  # Unpause to resume live feed
+            self.paused = False  
         else:
             pass
            
@@ -1921,9 +1956,9 @@ class Ui_MainWindow(QMainWindow):
 
             def ask_alignment(label):
                 res = self.verificationBox("Is the crosshair aligned to the center after moving?")
-                if res == 0:          # X clicked -> cancel the sequence
+                if res == 0:          
                     return False
-                aligned = (res == 1)  # 1 = Yes, 2 = No
+                aligned = (res == 1)  
                 results.append((label, aligned))
                 time.sleep(0.05)
                 return True
@@ -1935,12 +1970,12 @@ class Ui_MainWindow(QMainWindow):
             self.moveLeftSteps(travel_steps)
             time.sleep(1.5)
             self.moveRightSteps(travel_steps)
-            if not ask_alignment("Center After Left"): return
+            if not ask_alignment("Center After Left Movement"): return
 
             self.moveUpSteps(travel_steps)
             time.sleep(1.5)
             self.moveDownSteps(travel_steps)
-            if not ask_alignment("Center After Up"): return
+            if not ask_alignment("Center After Up Movement"): return
 
             no_count = sum(1 for _, ok in results if not ok)
             status = "FAILED" if no_count >= 2 else "PASSED"
@@ -2010,21 +2045,21 @@ class Ui_MainWindow(QMainWindow):
         print(f"Moving left {n} steps...")
         for i in range(n):
             self.moveLeft()
-            time.sleep(0.1)  # Increased delay for better stability
+            time.sleep(0.1)  
         print(f"Left movement completed. Current position: ({self.x}, {self.y})")
 
     def moveRightSteps(self, n):
         print(f"Moving right {n} steps...")
         for i in range(n):
             self.moveRight()
-            time.sleep(0.1)  # Increased delay for better stability
+            time.sleep(0.1)  
         print(f"Right movement completed. Current position: ({self.x}, {self.y})")
 
     def moveUpSteps(self, n):
         print(f"Moving up {n} steps...")
         for i in range(n):
             self.moveUp()
-            time.sleep(0.1)  # Increased delay for better stability
+            time.sleep(0.1)  
         print(f"Up movement completed. Current position: ({self.x}, {self.y})")
 
     def moveDownSteps(self, n):
