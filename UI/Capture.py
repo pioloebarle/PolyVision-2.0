@@ -1,114 +1,53 @@
 import sys
-from PyQt5 import QtWidgets
-from PyQt5.QtCore import Qt
-from PyQt5.QtWidgets import QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QFileDialog, QSpacerItem, QSizePolicy, QComboBox
-from PyQt5.QtCore import *
+import os
+from PyQt5 import QtCore, QtGui, QtWidgets
 from PyQt5.QtGui import QIcon
+from PyQt5.QtWidgets import QApplication, QMainWindow, QAction, QFileDialog, QInputDialog, QLineEdit, QPushButton
 
-
-
-class CaptureUI(QtWidgets.QDialog):
-    length_clicked = pyqtSignal()
-    width_clicked = pyqtSignal()
-    save_clicked = pyqtSignal()
-    on_rejected = pyqtSignal()
-
+class CalibrateUI(QtWidgets.QDialog): 
     def __init__(self):
         super().__init__()
+        self.initUI()
 
-        self.init_ui()
-
-    def init_ui(self):
-        self.setWindowTitle("Capture Image")
-        self.setFixedSize(400, 425)
+    def initUI(self):
+        self.setWindowTitle("Calibrate")
+        self.setFixedSize(415, 80)
         self.setWindowIcon(QIcon("res/PolyVisionLogo.png"))
 
-        layout = QVBoxLayout()
+        layout = QtWidgets.QFormLayout()
+        self.current_directory = QtWidgets.QLabel("")
+        self.distance_edit = QtWidgets.QLineEdit(self)
 
-        self.particle_name_edit = QLineEdit()
-        self.length_edit = QLineEdit()
-        self.width_edit = QLineEdit()
-        self.color_edit = QLineEdit()
-        self.shape_edit = QComboBox()
-        self.shape_edit.addItems(["Fragment", "Filament","Film", "Pellet", "Foam" ])
-        self.magnification_edit = QLineEdit()
-        self.note_edit = QLineEdit()
 
-        layout.addWidget(QLabel("Particle Name:"))
-        particle_name_layout = QHBoxLayout()
-        particle_name_layout.addWidget(self.particle_name_edit)
-        self.photo_options_combo = QComboBox()
-        self.photo_options_combo.addItems(["JPG", "JPEG", "PNG"])
-        self.photo_options_combo.setCurrentText("JPG")
-        particle_name_layout.addWidget(self.photo_options_combo)
-        layout.addLayout(particle_name_layout)
+        layout.addRow("Actual Distance:", self.distance_edit)
 
-        layout.addWidget(QLabel("Length (mm): "))
-        length_layout = QHBoxLayout()
-        length_layout.addWidget(self.length_edit)
-        self.measure_length_button = QPushButton(" Measure Length ", self)
-        self.measure_length_button.clicked.connect(self.measure_length)
-        length_layout.addWidget(self.measure_length_button)
-        layout.addLayout(length_layout)
 
-        layout.addWidget(QLabel("Width (mm):  "))
-        width_layout = QHBoxLayout()
-        width_layout.addWidget(self.width_edit)
-        self.measure_width_button = QPushButton(" Measure  Width ", self)
-        self.measure_width_button.clicked.connect(self.measure_width)
-        width_layout.addWidget(self.measure_width_button)
-        layout.addLayout(width_layout)
+        start_button = QtWidgets.QPushButton("Start")
 
-        layout.addWidget(QLabel("Color:"))
-        layout.addWidget(self.color_edit)
-        layout.addWidget(QLabel("Shape:"))
-        layout.addWidget(self.shape_edit)
-        layout.addWidget(QLabel("Magnification:"))
-        layout.addWidget(self.magnification_edit)
-        layout.addWidget(QLabel("Note:"))
-        layout.addWidget(self.note_edit)
+        button_box = QtWidgets.QDialogButtonBox(QtCore.Qt.Horizontal, self)
+        button_box.addButton(start_button, QtWidgets.QDialogButtonBox.AcceptRole)
+        button_box.addButton("Cancel", QtWidgets.QDialogButtonBox.RejectRole)
 
-        self.save_button = QPushButton("Save Image", self)
-        self.save_button.clicked.connect(self.saveFrame)
-        layout.addWidget(self.save_button)
-        self.shape_edit.currentIndexChanged.connect(self.shape_changed)
+        start_button.clicked.connect(self.on_accepted)
+        button_box.rejected.connect(self.on_rejected)
 
+        layout.addRow(button_box)
         self.setLayout(layout)
 
-    def shape_changed(self, index):
-        # Disable measure width button and width edit text when "Filament" is selected
-        if self.shape_edit.currentText() == "Filament":
-            self.measure_width_button.setEnabled(False)
-            self.width_edit.setEnabled(False)
-        else:
-            self.measure_width_button.setEnabled(True)
-            self.width_edit.setEnabled(True)
-    
-    def measure_length(self):
-        self.length_clicked.emit()
-        self.hide()
 
-    def measure_width(self):
-        self.width_clicked.emit()
-        self.hide()
+    def on_accepted(self):
+        distance = self.distance_edit.text()
+        self.accept()
 
-    def saveFrame(self):
-        self.save_clicked.emit()
-
-
-    
-    def closeEvent(self, event):
-        print("here")
-        self.on_rejected.emit()
-        event.accept()
+    def on_rejected(self):
+        self.reject()
 
 
 def main():
     app = QApplication(sys.argv)
-    stat_ui = CaptureUI()
+    stat_ui = CalibrateUI()
     stat_ui.show()
     sys.exit(app.exec_())
 
 if __name__ == "__main__":
     main()
-
